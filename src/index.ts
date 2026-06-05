@@ -45,6 +45,7 @@ export const PROOF_INGRESS_STATUS_PATH = SWITCHBOARD_STATUS_PATH;
 export const EIP712_DOMAIN_NAME = "ProofIngress";
 export const EIP712_DOMAIN_VERSION = "1";
 const DEFAULT_SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS = 7_200;
 
 type SwitchboardIntentHealthState =
   | "starting"
@@ -352,6 +353,7 @@ export interface SwitchboardRuntimeConfig {
   gatewayId?: string;
   gatewayUpstreamAdmissionUrl?: string;
   gatewayUpstreamAdmissionMode?: SwitchboardGatewayUpstreamAdmissionMode;
+  gatewayUpstreamAdmissionDeadlineSeconds?: string | number;
   endpointHostname?: string;
   certificateMode?: string;
   certificateHostnames?: string[];
@@ -975,6 +977,9 @@ export class SwitchboardRuntime {
       GATEWAY_ID: config.gatewayId,
       GATEWAY_UPSTREAM_ADMISSION_URL: config.gatewayUpstreamAdmissionUrl,
       GATEWAY_UPSTREAM_ADMISSION_MODE: config.gatewayUpstreamAdmissionMode,
+      GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS: config.gatewayUpstreamAdmissionDeadlineSeconds === undefined
+        ? undefined
+        : String(config.gatewayUpstreamAdmissionDeadlineSeconds),
       ENDPOINT_HOSTNAME: requiredRuntimeConfig(config.endpointHostname, "endpointHostname"),
       SWITCHBOARD_CERTIFICATE_MODE: config.certificateMode ?? "job-acme",
       SWITCHBOARD_CERTIFICATE_HOSTNAMES: (config.certificateHostnames ?? [config.endpointHostname]).filter(Boolean).join(",")
@@ -1332,7 +1337,7 @@ export class SwitchboardRuntime {
       validationHostname: this.configValue("VALIDATION_HOSTNAME"),
       upstreamPort: this.gatewayUpstreamPort(),
       nonce: randomBytes(16).toString("hex"),
-      deadline: String(Math.floor(Date.now() / 1000) + numberConfig(this, "GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS", 600))
+      deadline: String(Math.floor(Date.now() / 1000) + this.gatewayUpstreamAdmissionDeadlineSeconds())
     });
     return {
       request,
@@ -1407,6 +1412,14 @@ export class SwitchboardRuntime {
       return "relay-pull";
     }
     return "direct-post";
+  }
+
+  private gatewayUpstreamAdmissionDeadlineSeconds(): number {
+    return numberConfig(
+      this,
+      "GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS",
+      numberConfig(this, "GW_ADMISSION_DEADLINE_SECONDS", DEFAULT_GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS)
+    );
   }
 
   private upstreamAdmissionRequestContextError(request: GatewayUpstreamAdmissionPayload, runtimeSigner: string): string | undefined {

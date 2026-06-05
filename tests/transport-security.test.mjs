@@ -166,6 +166,7 @@ describe("Switchboard runtime transport security", () => {
       fetchImpl
     });
 
+    const deadlineFloor = Math.floor(Date.now() / 1000) + 7_200;
     await runtime.reportReady();
 
     assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
@@ -176,6 +177,8 @@ describe("Switchboard runtime transport security", () => {
     ]);
     assert.equal(calls[1].body.details.stage, "admission_requested");
     assert.equal(calls[2].body.request.upstreamPort, 3443);
+    assert.ok(Number(calls[2].body.request.deadline) >= deadlineFloor);
+    assert.ok(Number(calls[2].body.request.deadline) <= Math.floor(Date.now() / 1000) + 7_200);
     assert.equal(calls[2].body.requestSignature.length, 132);
     assert.ok(calls[2].body.candidateUpstreamIps.includes("192.168.1.44"));
     assert.ok(!calls[2].body.candidateUpstreamIps.includes("127.0.0.1"));
