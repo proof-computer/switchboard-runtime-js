@@ -1,4 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { networkInterfaces } from "node:os";
 import tls, { type SecureContext, type SecureContextOptions } from "node:tls";
 import * as acme from "acme-client";
@@ -6,29 +7,39 @@ import { ethers } from "ethers";
 import { requireSecureSwitchboardUrl, secureSwitchboardUrl, type SwitchboardTransportSecurityOptions } from "./transport.js";
 import {
   gatewayUpstreamAdmissionDigest,
+  gatewayUpstreamProbeResponseDigest,
   normalizeGatewayUpstreamAdmissionPayload,
+  normalizeGatewayUpstreamProbeResponsePayload,
   normalizeSecp256k1SignatureForDigest,
   type GatewayUpstreamAdmissionPayload,
+  type GatewayUpstreamProbeResponsePayload,
   type SignedGatewayUpstreamObservation
 } from "./gateway-upstream-admission.js";
 
 export {
   GATEWAY_UPSTREAM_ADMISSION_REQUEST_DOMAIN,
   GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
+  GATEWAY_UPSTREAM_PROBE_RESPONSE_DOMAIN,
   gatewayUpstreamAdmissionDigest,
   gatewayUpstreamAdmissionId,
   gatewayUpstreamObservationDigest,
+  gatewayUpstreamProbeResponseDigest,
   normalizeGatewayUpstreamAdmissionPayload,
   normalizeGatewayUpstreamObservationPayload,
+  normalizeGatewayUpstreamProbeResponsePayload,
   normalizeSecp256k1SignatureForDigest,
   recoverGatewayUpstreamAdmissionSigner,
+  recoverGatewayUpstreamProbeResponseSigner,
   type GatewayUpstreamAdmissionPayload,
   type GatewayUpstreamObservationPayload,
+  type GatewayUpstreamProbeResponsePayload,
+  type SignedGatewayUpstreamProbeResponse,
   type SignedGatewayUpstreamObservation
 } from "./gateway-upstream-admission.js";
 
 export const SWITCHBOARD_CHALLENGE_PATH = "/.well-known/proofcomputer/challenge";
 export const SWITCHBOARD_STATUS_PATH = "/.well-known/proofcomputer/status";
+export const SWITCHBOARD_UPSTREAM_ADMISSION_PATH = "/.well-known/proofcomputer/upstream-admission";
 export const PROOF_INGRESS_CHALLENGE_PATH = SWITCHBOARD_CHALLENGE_PATH;
 export const PROOF_INGRESS_STATUS_PATH = SWITCHBOARD_STATUS_PATH;
 export const EIP712_DOMAIN_NAME = "ProofIngress";
@@ -137,6 +148,9 @@ export interface SwitchboardJobSigner {
   }): Promise<string>;
   signGatewayUpstreamAdmission?(input: {
     request: GatewayUpstreamAdmissionPayload;
+  }): Promise<string>;
+  signGatewayUpstreamProbeResponse?(input: {
+    probe: GatewayUpstreamProbeResponsePayload;
   }): Promise<string>;
 }
 
@@ -337,6 +351,7 @@ export interface SwitchboardRuntimeConfig {
   processorId?: string;
   gatewayId?: string;
   gatewayUpstreamAdmissionUrl?: string;
+  gatewayUpstreamAdmissionMode?: SwitchboardGatewayUpstreamAdmissionMode;
   endpointHostname?: string;
   certificateMode?: string;
   certificateHostnames?: string[];
@@ -366,11 +381,50 @@ export interface SwitchboardRuntimePrepareResult {
 }
 
 export interface SwitchboardGatewayUpstreamAdmissionResult {
+  mode: "direct-post";
   request: GatewayUpstreamAdmissionPayload;
   requestSignature: string;
   observation: SignedGatewayUpstreamObservation["observation"];
   observationSignature: SignedGatewayUpstreamObservation["signature"];
   relayResponse: unknown;
+}
+
+export interface SwitchboardGatewayUpstreamAdmissionRequestResult {
+  mode: "relay-pull";
+  request: GatewayUpstreamAdmissionPayload;
+  requestSignature: string;
+  requestDigest: string;
+  candidateUpstreamIps: string[];
+  relayResponse: unknown;
+}
+
+export type SwitchboardGatewayUpstreamAdmissionMode = "direct-post" | "relay-pull";
+export type SwitchboardReadyGatewayUpstreamAdmission =
+  | SwitchboardGatewayUpstreamAdmissionResult
+  | SwitchboardGatewayUpstreamAdmissionRequestResult;
+
+export interface SwitchboardUpstreamAdmissionProbeRequest {
+  request?: GatewayUpstreamAdmissionPayload;
+  requestDigest?: unknown;
+  gatewayNonce?: unknown;
+}
+
+export interface SwitchboardUpstreamAdmissionProbeResponse {
+  ok: true;
+  probe: GatewayUpstreamProbeResponsePayload;
+  signature: string;
+}
+
+export interface SwitchboardUpstreamAdmissionProbeError {
+  ok: false;
+  error: string;
+  reason?: string;
+}
+
+export interface SwitchboardUpstreamAdmissionProbeResult {
+  statusCode: number;
+  headers: Record<string, string>;
+  body: SwitchboardUpstreamAdmissionProbeResponse | SwitchboardUpstreamAdmissionProbeError;
 }
 
 export type SwitchboardTlsOptions = SecureContextOptions & {
@@ -611,7 +665,42 @@ export class SwitchboardRuntime {
     if (!this.intentConfigured()) {
       return;
     }
-    const upstreamAdmission = await this.admitGatewayUpstream();
+    await this.reportIntentHealthBestEffort("registered", {
+      ...details,
+      stage: "ready_reporting",
+      sessionId: this.sessionId(),
+      endpointHostname: this.configValue("ENDPOINT_HOSTNAME")
+    });
+    let upstreamAdmission: SwitchboardReadyGatewayUpstreamAdmission | undefined;
+    const admissionMode = this.gatewayUpstreamAdmissionMode();
+    const admittingStage = admissionMode === "relay-pull" ? "admission_requested" : "gateway_upstream_admitting";
+    const failedStage = admissionMode === "relay-pull" ? "admission_request_failed" : "gateway_upstream_admission_failed";
+    try {
+      await this.reportIntentHealthBestEffort("registered", {
+        ...details,
+        stage: admittingStage,
+        gatewayUpstreamAdmissionMode: admissionMode,
+        sessionId: this.sessionId(),
+        endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
+        gatewayId: this.configValue("GATEWAY_ID"),
+        upstreamPort: this.gatewayUpstreamPort()
+      });
+      upstreamAdmission = admissionMode === "relay-pull"
+        ? await this.requestGatewayUpstreamAdmission()
+        : await this.admitGatewayUpstream();
+    } catch (error) {
+      await this.reportIntentHealthBestEffort("registered", {
+        ...details,
+        stage: failedStage,
+        gatewayUpstreamAdmissionMode: admissionMode,
+        sessionId: this.sessionId(),
+        endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
+        gatewayId: this.configValue("GATEWAY_ID"),
+        upstreamPort: this.gatewayUpstreamPort(),
+        error: safeError(error)
+      });
+      throw error;
+    }
     await this.reportIntentHealthBestEffort("ready", {
       sessionId: this.sessionId(),
       endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
@@ -619,9 +708,17 @@ export class SwitchboardRuntime {
       port: this.gatewayUpstreamPort(),
       gatewayUpstreamAdmission: upstreamAdmission
         ? {
-            admissionId: upstreamAdmission.observation.admissionId,
-            observedAt: upstreamAdmission.observation.observedAt,
-            expiresAt: upstreamAdmission.observation.expiresAt
+            mode: upstreamAdmission.mode,
+            requestDigest: gatewayUpstreamAdmissionDigest(upstreamAdmission.request),
+            ...(upstreamAdmission.mode === "direct-post"
+              ? {
+                  admissionId: upstreamAdmission.observation.admissionId,
+                  observedAt: upstreamAdmission.observation.observedAt,
+                  expiresAt: upstreamAdmission.observation.expiresAt
+                }
+              : {
+                  candidateUpstreamIps: upstreamAdmission.candidateUpstreamIps
+                })
           }
         : undefined,
       ...details
@@ -877,6 +974,7 @@ export class SwitchboardRuntime {
       PROCESSOR_ID: requiredRuntimeConfig(config.processorId, "processorId"),
       GATEWAY_ID: config.gatewayId,
       GATEWAY_UPSTREAM_ADMISSION_URL: config.gatewayUpstreamAdmissionUrl,
+      GATEWAY_UPSTREAM_ADMISSION_MODE: config.gatewayUpstreamAdmissionMode,
       ENDPOINT_HOSTNAME: requiredRuntimeConfig(config.endpointHostname, "endpointHostname"),
       SWITCHBOARD_CERTIFICATE_MODE: config.certificateMode ?? "job-acme",
       SWITCHBOARD_CERTIFICATE_HOSTNAMES: (config.certificateHostnames ?? [config.endpointHostname]).filter(Boolean).join(",")
@@ -1077,24 +1175,7 @@ export class SwitchboardRuntime {
     if (this.gatewayUpstreamAdmission && Date.parse(this.gatewayUpstreamAdmission.observation.expiresAt) > Date.now()) {
       return this.gatewayUpstreamAdmission;
     }
-    const signer = await this.jobSigner();
-    if (!signer.signer.signGatewayUpstreamAdmission) {
-      throw new Error("Current Switchboard job signer cannot sign gateway upstream admissions");
-    }
-    const request = normalizeGatewayUpstreamAdmissionPayload({
-      intentId: this.requiredConfig("SWITCHBOARD_INTENT_ID"),
-      sessionId: this.requiredConfig("SESSION_ID"),
-      runtimeSigner: await signer.signer.getAddress(),
-      operatorId: this.requiredConfig("OPERATOR_ID"),
-      gatewayId: this.requiredConfig("GATEWAY_ID"),
-      processorId: this.requiredConfig("PROCESSOR_ID"),
-      hostname: this.requiredConfig("ENDPOINT_HOSTNAME"),
-      validationHostname: this.configValue("VALIDATION_HOSTNAME"),
-      upstreamPort: this.gatewayUpstreamPort(),
-      nonce: randomBytes(16).toString("hex"),
-      deadline: String(Math.floor(Date.now() / 1000) + numberConfig(this, "GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS", 600))
-    });
-    const requestSignature = await signer.signer.signGatewayUpstreamAdmission({ request });
+    const { request, requestSignature } = await this.buildGatewayUpstreamAdmissionRequest();
     const gatewayUrl = requireSecureSwitchboardUrl(gatewayAdmissionUrl, "Switchboard gateway upstream admission URL", this.transportOptions());
     allowAcurastHostname(gatewayUrl.toString(), this.std);
     const gatewayResponse = await this.fetchImpl(gatewayUrl, {
@@ -1115,7 +1196,8 @@ export class SwitchboardRuntime {
       observation,
       observationSignature
     });
-    const result = {
+    const result: SwitchboardGatewayUpstreamAdmissionResult = {
+      mode: "direct-post",
       request,
       requestSignature,
       observation,
@@ -1131,6 +1213,131 @@ export class SwitchboardRuntime {
       expiresAt: observation.expiresAt
     });
     return result;
+  }
+
+  async requestGatewayUpstreamAdmission(): Promise<SwitchboardGatewayUpstreamAdmissionRequestResult | undefined> {
+    if (!this.intentConfigured()) {
+      return undefined;
+    }
+    const { request, requestSignature } = await this.buildGatewayUpstreamAdmissionRequest();
+    const candidateUpstreamIps = resolveCandidateUpstreamIps(this.configValue("SWITCHBOARD_UPSTREAM_CANDIDATE_IPS"));
+    const relayResponse = await this.submitGatewayUpstreamAdmissionRequest({
+      request,
+      requestSignature,
+      candidateUpstreamIps
+    });
+    const result: SwitchboardGatewayUpstreamAdmissionRequestResult = {
+      mode: "relay-pull",
+      request,
+      requestSignature,
+      requestDigest: gatewayUpstreamAdmissionDigest(request),
+      candidateUpstreamIps,
+      relayResponse
+    };
+    await this.log("gateway-upstream-admission-requested", {
+      gatewayId: request.gatewayId,
+      upstreamPort: request.upstreamPort,
+      candidateUpstreamIps,
+      requestDigest: result.requestDigest
+    });
+    return result;
+  }
+
+  async buildUpstreamAdmissionProbeResult(
+    input: SwitchboardUpstreamAdmissionProbeRequest
+  ): Promise<SwitchboardUpstreamAdmissionProbeResult> {
+    try {
+      const requestDigest = probeRequestDigest(input);
+      const gatewayNonce = typeof input.gatewayNonce === "string" && input.gatewayNonce.length > 0
+        ? input.gatewayNonce
+        : undefined;
+      if (!requestDigest || !gatewayNonce) {
+        return {
+          statusCode: 400,
+          headers: { "cache-control": "no-store" },
+          body: { ok: false, error: "invalid_probe_request", reason: "requestDigest and gatewayNonce are required" }
+        };
+      }
+      const request = input.request ? normalizeGatewayUpstreamAdmissionPayload(input.request) : undefined;
+      if (request && gatewayUpstreamAdmissionDigest(request).toLowerCase() !== requestDigest.toLowerCase()) {
+        return {
+          statusCode: 400,
+          headers: { "cache-control": "no-store" },
+          body: { ok: false, error: "request_digest_mismatch" }
+        };
+      }
+      const signer = await this.jobSigner();
+      if (!signer.signer.signGatewayUpstreamProbeResponse) {
+        return {
+          statusCode: 503,
+          headers: { "cache-control": "no-store" },
+          body: { ok: false, error: "probe_signing_unavailable" }
+        };
+      }
+      const runtimeSigner = await signer.signer.getAddress();
+      const contextError = request ? this.upstreamAdmissionRequestContextError(request, runtimeSigner) : undefined;
+      if (contextError) {
+        return {
+          statusCode: 422,
+          headers: { "cache-control": "no-store" },
+          body: { ok: false, error: "probe_context_mismatch", reason: contextError }
+        };
+      }
+      const probe = normalizeGatewayUpstreamProbeResponsePayload({
+        version: 1,
+        kind: "switchboard.gateway-upstream-probe-response",
+        requestDigest,
+        gatewayNonce,
+        intentId: request?.intentId ?? this.requiredConfig("SWITCHBOARD_INTENT_ID"),
+        sessionId: request?.sessionId ?? this.requiredConfig("SESSION_ID"),
+        runtimeSigner,
+        upstreamPort: request?.upstreamPort ?? this.gatewayUpstreamPort(),
+        signedAt: new Date().toISOString()
+      });
+      const signature = await signer.signer.signGatewayUpstreamProbeResponse({ probe });
+      return {
+        statusCode: 200,
+        headers: { "cache-control": "no-store" },
+        body: { ok: true, probe, signature }
+      };
+    } catch (error) {
+      return {
+        statusCode: 500,
+        headers: { "cache-control": "no-store" },
+        body: {
+          ok: false,
+          error: "probe_failed",
+          reason: error instanceof Error ? error.message : String(error)
+        }
+      };
+    }
+  }
+
+  private async buildGatewayUpstreamAdmissionRequest(): Promise<{
+    request: GatewayUpstreamAdmissionPayload;
+    requestSignature: string;
+  }> {
+    const signer = await this.jobSigner();
+    if (!signer.signer.signGatewayUpstreamAdmission) {
+      throw new Error("Current Switchboard job signer cannot sign gateway upstream admissions");
+    }
+    const request = normalizeGatewayUpstreamAdmissionPayload({
+      intentId: this.requiredConfig("SWITCHBOARD_INTENT_ID"),
+      sessionId: this.requiredConfig("SESSION_ID"),
+      runtimeSigner: await signer.signer.getAddress(),
+      operatorId: this.requiredConfig("OPERATOR_ID"),
+      gatewayId: this.requiredConfig("GATEWAY_ID"),
+      processorId: this.requiredConfig("PROCESSOR_ID"),
+      hostname: this.requiredConfig("ENDPOINT_HOSTNAME"),
+      validationHostname: this.configValue("VALIDATION_HOSTNAME"),
+      upstreamPort: this.gatewayUpstreamPort(),
+      nonce: randomBytes(16).toString("hex"),
+      deadline: String(Math.floor(Date.now() / 1000) + numberConfig(this, "GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS", 600))
+    });
+    return {
+      request,
+      requestSignature: await signer.signer.signGatewayUpstreamAdmission({ request })
+    };
   }
 
   private async submitGatewayUpstreamAdmission(input: {
@@ -1160,12 +1367,59 @@ export class SwitchboardRuntime {
     return body;
   }
 
+  private async submitGatewayUpstreamAdmissionRequest(input: {
+    request: GatewayUpstreamAdmissionPayload;
+    requestSignature: string;
+    candidateUpstreamIps: string[];
+  }): Promise<unknown> {
+    const response = await this.fetchImpl(secureSwitchboardUrl(
+      `/v1/deployment-intents/${encodeURIComponent(this.requiredConfig("SWITCHBOARD_INTENT_ID"))}/upstream-admission-requests`,
+      this.requiredSecureRelayUrl("SWITCHBOARD_RELAY_URL"),
+      "Switchboard relay URL",
+      this.transportOptions()
+    ), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.requiredConfig("SWITCHBOARD_INTENT_TOKEN")}`
+      },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(this.intentRequestTimeoutMs())
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(`Switchboard relay upstream admission request failed: ${response.status} ${JSON.stringify(body)}`);
+    }
+    return body;
+  }
+
   private gatewayUpstreamPort(): number {
     return numberConfig(
       this,
       "GATEWAY_UPSTREAM_PORT",
       numberConfig(this, "SWITCHBOARD_UPSTREAM_PORT", numberConfig(this, "PORT", 3000))
     );
+  }
+
+  private gatewayUpstreamAdmissionMode(): SwitchboardGatewayUpstreamAdmissionMode {
+    const value = this.configValue("GATEWAY_UPSTREAM_ADMISSION_MODE") ?? this.configValue("SWITCHBOARD_GATEWAY_UPSTREAM_ADMISSION_MODE");
+    if (value === "relay-pull") {
+      return "relay-pull";
+    }
+    return "direct-post";
+  }
+
+  private upstreamAdmissionRequestContextError(request: GatewayUpstreamAdmissionPayload, runtimeSigner: string): string | undefined {
+    if (request.intentId !== this.requiredConfig("SWITCHBOARD_INTENT_ID")) return "intent_id_mismatch";
+    if (request.sessionId.toLowerCase() !== this.requiredConfig("SESSION_ID").toLowerCase()) return "session_id_mismatch";
+    if (ethers.getAddress(request.runtimeSigner) !== ethers.getAddress(runtimeSigner)) return "runtime_signer_mismatch";
+    if (request.operatorId.toLowerCase() !== this.requiredConfig("OPERATOR_ID").toLowerCase()) return "operator_id_mismatch";
+    if (request.gatewayId !== this.requiredConfig("GATEWAY_ID")) return "gateway_id_mismatch";
+    if (request.processorId.toLowerCase() !== this.requiredConfig("PROCESSOR_ID").toLowerCase()) return "processor_id_mismatch";
+    if (request.hostname !== normalizeHostname(this.requiredConfig("ENDPOINT_HOSTNAME"))) return "hostname_mismatch";
+    if (request.upstreamPort !== this.gatewayUpstreamPort()) return "upstream_port_mismatch";
+    if (Number(request.deadline) <= Math.floor(Date.now() / 1000)) return "admission_request_expired";
+    return undefined;
   }
 
   private prepareManagedCertificateResult(certificates: SwitchboardManagedCertificate[]): SwitchboardRuntimePrepareResult {
@@ -1614,6 +1868,9 @@ export function privateKeyJobSigner(privateKey: string): SwitchboardJobSigner {
     },
     async signGatewayUpstreamAdmission(input) {
       return wallet.signingKey.sign(gatewayUpstreamAdmissionDigest(input.request)).serialized;
+    },
+    async signGatewayUpstreamProbeResponse(input) {
+      return wallet.signingKey.sign(gatewayUpstreamProbeResponseDigest(input.probe)).serialized;
     }
   };
 }
@@ -1658,6 +1915,10 @@ export function acurastJobSigner(
     },
     async signGatewayUpstreamAdmission(input) {
       const digest = gatewayUpstreamAdmissionDigest(input.request);
+      return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
+    },
+    async signGatewayUpstreamProbeResponse(input) {
+      const digest = gatewayUpstreamProbeResponseDigest(input.probe);
       return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
     }
   };
@@ -2056,6 +2317,39 @@ export function publicNetworkAddresses(): string[] {
   } catch {
     return [];
   }
+}
+
+function resolveCandidateUpstreamIps(configured: string | undefined): string[] {
+  return [
+    ...new Set(
+      [
+        ...splitCsv(configured ?? ""),
+        ...publicNetworkAddresses()
+      ]
+        .map((value) => value.trim())
+        .filter(isCandidateIpv4Address)
+    )
+  ];
+}
+
+function isCandidateIpv4Address(value: string): boolean {
+  if (isIP(value) !== 4) {
+    return false;
+  }
+  const octets = value.split(".").map((item) => Number(item));
+  if (octets.length !== 4 || octets.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) {
+    return false;
+  }
+  const [first, second] = octets;
+  if (first === undefined || second === undefined) {
+    return false;
+  }
+  return !(
+    first === 0 ||
+    first === 127 ||
+    first >= 224 ||
+    (first === 169 && second === 254)
+  );
 }
 
 export function allowAcurastHostname(rawUrl: string, std: AcurastRuntimeStd | undefined = (globalThis as { _STD_?: AcurastRuntimeStd })._STD_): void {
@@ -2556,6 +2850,24 @@ function objectRecordField(record: unknown, name: string): Record<string, unknow
     throw new Error(`${name} missing`);
   }
   return value as Record<string, unknown>;
+}
+
+function probeRequestDigest(input: SwitchboardUpstreamAdmissionProbeRequest): string | undefined {
+  if (typeof input.requestDigest === "string" && input.requestDigest.length > 0) {
+    try {
+      return ethers.hexlify(input.requestDigest);
+    } catch {
+      return undefined;
+    }
+  }
+  if (input.request) {
+    try {
+      return gatewayUpstreamAdmissionDigest(normalizeGatewayUpstreamAdmissionPayload(input.request));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function dynamicString(value: string | (() => string)): string {

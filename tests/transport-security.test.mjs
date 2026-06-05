@@ -130,18 +130,62 @@ describe("Switchboard runtime transport security", () => {
     await runtime.reportReady();
 
     assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
       "POST https://gateway.example.test/v1/upstream-admissions",
       "POST https://relay.example.test/v1/deployment-intents/di_test/upstream-admissions",
       "POST https://relay.example.test/v1/deployment-intents/di_test/health"
     ]);
-    assert.equal(calls[0].body.request.upstreamPort, 3443);
-    assert.equal(calls[1].body.requestSignature, calls[0].body.signature);
-    assert.equal(calls[1].body.observation.observedIp, "203.0.113.44");
-    assert.equal(calls[2].body.state, "ready");
-    assert.equal(calls[2].body.details.gatewayUpstreamAdmission.admissionId, `0x${"aa".repeat(32)}`);
+    assert.equal(calls[0].body.state, "registered");
+    assert.equal(calls[0].body.details.stage, "ready_reporting");
+    assert.equal(calls[1].body.state, "registered");
+    assert.equal(calls[1].body.details.stage, "gateway_upstream_admitting");
+    assert.equal(calls[2].body.request.upstreamPort, 3443);
+    assert.equal(calls[3].body.requestSignature, calls[2].body.signature);
+    assert.equal(calls[3].body.observation.observedIp, "203.0.113.44");
+    assert.equal(calls[4].body.state, "ready");
+    assert.equal(calls[4].body.details.gatewayUpstreamAdmission.admissionId, `0x${"aa".repeat(32)}`);
   });
 
-  it("rejects plaintext gateway admission URLs before fetch unless explicitly opted in", async () => {
+  it("reports gateway admission failures before ready retry", async () => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const parsedUrl = new URL(url.toString());
+      const body = init.body ? JSON.parse(init.body.toString()) : undefined;
+      calls.push({ url: parsedUrl.toString(), path: parsedUrl.pathname, method: init.method ?? "GET", body });
+
+      if (parsedUrl.hostname === "gateway.example.test") {
+        return jsonResponse({ ok: false, error: "gateway_unavailable" }, 503);
+      }
+
+      return jsonResponse({ ok: true });
+    };
+
+    const runtime = createSwitchboardRuntime({
+      env: runtimeEnv({
+        SWITCHBOARD_RELAY_URL: "https://relay.example.test",
+        GATEWAY_UPSTREAM_ADMISSION_URL: "https://gateway.example.test/v1/upstream-admissions",
+        GATEWAY_UPSTREAM_PORT: "3443"
+      }),
+      fetchImpl
+    });
+
+    await assert.rejects(() => runtime.reportReady(), /Switchboard gateway upstream admission failed: 503/);
+
+    assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
+      "POST https://gateway.example.test/v1/upstream-admissions",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health"
+    ]);
+    assert.equal(calls[0].body.details.stage, "ready_reporting");
+    assert.equal(calls[1].body.details.stage, "gateway_upstream_admitting");
+    assert.equal(calls[3].body.state, "registered");
+    assert.equal(calls[3].body.details.stage, "gateway_upstream_admission_failed");
+    assert.equal(calls[3].body.details.error.message, "Switchboard gateway upstream admission failed: 503 {\"ok\":false,\"error\":\"gateway_unavailable\"}");
+  });
+
+  it("rejects plaintext gateway admission URLs before fetch", async () => {
     const fetchImpl = recordingFetch();
     const runtime = createSwitchboardRuntime({
       env: runtimeEnv({
@@ -272,9 +316,9 @@ function recordingFetch(body = { ok: true }) {
   return fetchImpl;
 }
 
-function jsonResponse(body) {
+function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
-    status: 200,
+    status,
     headers: { "content-type": "application/json" }
   });
 }

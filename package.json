@@ -1,6 +1,6 @@
 {
   "name": "@proof-computer/switchboard-runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Job-side runtime helpers for Switchboard Acurast webserver jobs.",
   "repository": {
     "type": "git",
