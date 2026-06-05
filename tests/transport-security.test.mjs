@@ -147,6 +147,43 @@ describe("Switchboard runtime transport security", () => {
     assert.equal(calls[4].body.details.gatewayUpstreamAdmission.admissionId, `0x${"aa".repeat(32)}`);
   });
 
+  it("requests relay-pull upstream admission and reports HTTPS ready without gateway egress", async () => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const parsedUrl = new URL(url.toString());
+      const body = init.body ? JSON.parse(init.body.toString()) : undefined;
+      calls.push({ url: parsedUrl.toString(), path: parsedUrl.pathname, method: init.method ?? "GET", body });
+      return jsonResponse({ ok: true, candidateUpstreamIps: body?.candidateUpstreamIps });
+    };
+
+    const runtime = createSwitchboardRuntime({
+      env: runtimeEnv({
+        SWITCHBOARD_RELAY_URL: "https://relay.example.test",
+        GATEWAY_UPSTREAM_ADMISSION_MODE: "relay-pull",
+        GATEWAY_UPSTREAM_PORT: "3443",
+        SWITCHBOARD_UPSTREAM_CANDIDATE_IPS: "192.168.1.44,127.0.0.1,bad"
+      }),
+      fetchImpl
+    });
+
+    await runtime.reportReady();
+
+    assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/upstream-admission-requests",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/health"
+    ]);
+    assert.equal(calls[1].body.details.stage, "admission_requested");
+    assert.equal(calls[2].body.request.upstreamPort, 3443);
+    assert.equal(calls[2].body.requestSignature.length, 132);
+    assert.ok(calls[2].body.candidateUpstreamIps.includes("192.168.1.44"));
+    assert.ok(!calls[2].body.candidateUpstreamIps.includes("127.0.0.1"));
+    assert.equal(calls[3].body.state, "ready");
+    assert.equal(calls[3].body.details.gatewayUpstreamAdmission.mode, "relay-pull");
+    assert.deepEqual(calls[3].body.details.gatewayUpstreamAdmission.candidateUpstreamIps, calls[2].body.candidateUpstreamIps);
+  });
+
   it("reports gateway admission failures before ready retry", async () => {
     const calls = [];
     const fetchImpl = async (url, init = {}) => {
