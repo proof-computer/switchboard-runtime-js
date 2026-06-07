@@ -46,6 +46,7 @@ export const EIP712_DOMAIN_NAME = "ProofIngress";
 export const EIP712_DOMAIN_VERSION = "1";
 const DEFAULT_SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS = 7_200;
+const DEFAULT_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS = 60_000;
 
 type SwitchboardIntentHealthState =
   | "starting"
@@ -310,6 +311,7 @@ export type SwitchboardCertificateFailureStage =
   | "csr_generation"
   | "request_signing"
   | "relay_request"
+  | "activation_deadline"
   | "certificate_install"
   | "certificate_authorization"
   | "acme_issuance"
@@ -354,6 +356,7 @@ export interface SwitchboardRuntimeConfig {
   gatewayUpstreamAdmissionUrl?: string;
   gatewayUpstreamAdmissionMode?: SwitchboardGatewayUpstreamAdmissionMode;
   gatewayUpstreamAdmissionDeadlineSeconds?: string | number;
+  activationDeadline?: string | number;
   endpointHostname?: string;
   certificateMode?: string;
   certificateHostnames?: string[];
@@ -627,7 +630,7 @@ export class SwitchboardRuntime {
     if (requiredRegistrationEnv().every((name) => this.configValue(name))) {
       const registration = await this.registerIngress(1);
       const certificates = await this.requestCertificates();
-      return { ...this.prepareManagedCertificateResult(certificates), registration };
+      return { ...(await this.prepareManagedCertificateResult(certificates)), registration };
     }
 
     return { certificates: [] };
@@ -770,18 +773,23 @@ export class SwitchboardRuntime {
         const registration = await this.registerIngress(attempt);
         await this.reportIntentHealthBestEffort("registered", { sessionId: this.sessionId() });
         const certificates = await this.requestCertificates();
-        return { ...this.prepareManagedCertificateResult(certificates), registration };
+        return { ...(await this.prepareManagedCertificateResult(certificates)), registration };
       } catch (error) {
-        const willRetry = maxAttempts === 0 || attempt < maxAttempts;
+        const certificateError = error instanceof SwitchboardCertificateError ? error : undefined;
+        const willRetry = !certificateError && (maxAttempts === 0 || attempt < maxAttempts);
+        const errorDetails = certificateError
+          ? switchboardCertificateErrorDetails(certificateError)
+          : { error: error instanceof Error ? error.message : String(error) };
         await this.log("deployment-intent-loop-failed", {
           attempt,
           maxAttempts,
           retryMs: willRetry ? retryMs : undefined,
-          error: safeError(error)
+          error: safeError(error),
+          ...errorDetails
         });
         await this.reportIntentHealth(willRetry ? "waiting_funding" : "failed", {
           attempt,
-          error: error instanceof Error ? error.message : String(error)
+          ...errorDetails
         }).catch(() => undefined);
         if (!willRetry) {
           throw error;
@@ -980,6 +988,9 @@ export class SwitchboardRuntime {
       GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS: config.gatewayUpstreamAdmissionDeadlineSeconds === undefined
         ? undefined
         : String(config.gatewayUpstreamAdmissionDeadlineSeconds),
+      SWITCHBOARD_SESSION_ACTIVATION_DEADLINE: config.activationDeadline === undefined
+        ? undefined
+        : String(config.activationDeadline),
       ENDPOINT_HOSTNAME: requiredRuntimeConfig(config.endpointHostname, "endpointHostname"),
       SWITCHBOARD_CERTIFICATE_MODE: config.certificateMode ?? "job-acme",
       SWITCHBOARD_CERTIFICATE_HOSTNAMES: (config.certificateHostnames ?? [config.endpointHostname]).filter(Boolean).join(",")
@@ -1053,11 +1064,16 @@ export class SwitchboardRuntime {
     const certificateRequestDetails = {
       hostnames,
       certificateKeyAlgorithm,
-      requestTimeoutMs
+      requestTimeoutMs,
+      activationDeadline: this.sessionActivationDeadlineString()
     };
 
     for (let attempt = 1; maxAttempts === 0 || attempt <= maxAttempts; attempt += 1) {
       try {
+        const exhaustedWindow = this.certificateActivationWindowExhausted();
+        if (exhaustedWindow) {
+          throw this.certificateActivationDeadlineError(exhaustedWindow);
+        }
         await this.reportIntentHealth("certificate_requesting", {
           attempt,
           stage: "certificate_request",
@@ -1142,11 +1158,19 @@ export class SwitchboardRuntime {
         const certificateError = asSwitchboardCertificateError(error, {
           stage: "certificate_request"
         });
-        const retryable = certificateError.stage !== "certificate_config" && certificateError.stage !== "hostname_config";
-        const willRetry = retryable && (maxAttempts === 0 || attempt < maxAttempts);
         const retryAfterMs = certificateRetryAfterMs(certificateError);
         const nextRetryMs = retryAfterMs ?? retryMs;
-        const errorDetails = switchboardCertificateErrorDetails(certificateError);
+        const exhaustedBeforeRetry = this.certificateActivationWindowExhausted(Date.now() + nextRetryMs);
+        const blockedByActivationWindow = Boolean(exhaustedBeforeRetry && certificateError.stage !== "activation_deadline");
+        const finalError = blockedByActivationWindow
+          ? this.certificateActivationDeadlineError(exhaustedBeforeRetry!, certificateError.hostname, certificateError)
+          : certificateError;
+        const retryable =
+          finalError.stage !== "certificate_config" &&
+          finalError.stage !== "hostname_config" &&
+          finalError.stage !== "activation_deadline";
+        const willRetry = retryable && (maxAttempts === 0 || attempt < maxAttempts);
+        const errorDetails = switchboardCertificateErrorDetails(finalError);
         await this.log("certificate-request-failed", {
           attempt,
           maxAttempts,
@@ -1163,7 +1187,7 @@ export class SwitchboardRuntime {
           ...errorDetails
         }).catch(() => undefined);
         if (!willRetry) {
-          throw certificateError;
+          throw finalError;
         }
         await sleep(nextRetryMs);
       }
@@ -1422,6 +1446,54 @@ export class SwitchboardRuntime {
     );
   }
 
+  private sessionActivationDeadlineString(): string | undefined {
+    return this.configValue("SWITCHBOARD_SESSION_ACTIVATION_DEADLINE") ?? this.configValue("SESSION_ACTIVATION_DEADLINE");
+  }
+
+  private certificateActivationWindowExhausted(nowMs = Date.now()): Record<string, unknown> | undefined {
+    const rawDeadline = this.sessionActivationDeadlineString();
+    if (!rawDeadline) {
+      return undefined;
+    }
+    const activationDeadlineSeconds = Number(rawDeadline);
+    if (!Number.isFinite(activationDeadlineSeconds) || activationDeadlineSeconds <= 0) {
+      return undefined;
+    }
+    const activationDeadlineMs = activationDeadlineSeconds * 1000;
+    const safetyMs = numberConfig(
+      this,
+      "SWITCHBOARD_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS",
+      DEFAULT_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS
+    );
+    const remainingMs = activationDeadlineMs - nowMs;
+    if (remainingMs > safetyMs) {
+      return undefined;
+    }
+    return {
+      reason: remainingMs <= 0 ? "activation_window_expired" : "activation_window_expiring",
+      activationDeadline: String(Math.floor(activationDeadlineSeconds)),
+      activationDeadlineIso: new Date(activationDeadlineMs).toISOString(),
+      remainingMs,
+      safetyMs
+    };
+  }
+
+  private certificateActivationDeadlineError(
+    details: Record<string, unknown>,
+    hostname?: string,
+    lastError?: SwitchboardCertificateError
+  ): SwitchboardCertificateError {
+    return new SwitchboardCertificateError("Switchboard certificate request stopped because the session activation window is exhausted", {
+      stage: "activation_deadline",
+      hostname,
+      details: {
+        ...details,
+        lastError: lastError ? switchboardCertificateErrorDetails(lastError) : undefined
+      },
+      cause: lastError
+    });
+  }
+
   private upstreamAdmissionRequestContextError(request: GatewayUpstreamAdmissionPayload, runtimeSigner: string): string | undefined {
     if (request.intentId !== this.requiredConfig("SWITCHBOARD_INTENT_ID")) return "intent_id_mismatch";
     if (request.sessionId.toLowerCase() !== this.requiredConfig("SESSION_ID").toLowerCase()) return "session_id_mismatch";
@@ -1435,8 +1507,8 @@ export class SwitchboardRuntime {
     return undefined;
   }
 
-  private prepareManagedCertificateResult(certificates: SwitchboardManagedCertificate[]): SwitchboardRuntimePrepareResult {
-    this.replaceManagedCertificates(certificates);
+  private async prepareManagedCertificateResult(certificates: SwitchboardManagedCertificate[]): Promise<SwitchboardRuntimePrepareResult> {
+    await this.replaceManagedCertificates(certificates);
     this.startCustomerHostnamePolling();
     return {
       certificates: this.managedCertificates,
@@ -1444,18 +1516,23 @@ export class SwitchboardRuntime {
     };
   }
 
-  private replaceManagedCertificates(certificates: SwitchboardManagedCertificate[]): void {
+  private async replaceManagedCertificates(certificates: SwitchboardManagedCertificate[]): Promise<void> {
     this.managedCertificates.splice(0, this.managedCertificates.length);
     this.managedCertificateContexts.clear();
     for (const certificate of certificates) {
-      this.addManagedCertificate(certificate);
+      await this.addManagedCertificate(certificate);
     }
   }
 
-  private addManagedCertificate(certificate: SwitchboardManagedCertificate): boolean {
+  private async addManagedCertificate(certificate: SwitchboardManagedCertificate): Promise<boolean> {
     const hostname = normalizeHostname(certificate.hostname);
     const existingIndex = this.managedCertificates.findIndex((item) => normalizeHostname(item.hostname) === hostname);
-    void this.reportIntentHealthBestEffort("certificate_installing", {
+    await this.reportIntentHealthBestEffort("certificate_installing", {
+      hostname,
+      issuer: certificate.issuer,
+      notAfter: certificate.notAfter
+    });
+    await this.log("certificate-install-started", {
       hostname,
       issuer: certificate.issuer,
       notAfter: certificate.notAfter
@@ -1473,7 +1550,8 @@ export class SwitchboardRuntime {
         details: safeError(error),
         cause: error
       });
-      void this.reportIntentHealthBestEffort("failed", switchboardCertificateErrorDetails(certificateError));
+      await this.reportIntentHealthBestEffort("failed", switchboardCertificateErrorDetails(certificateError));
+      await this.log("certificate-install-failed", switchboardCertificateErrorDetails(certificateError));
       throw certificateError;
     }
     if (existingIndex >= 0) {
@@ -1482,7 +1560,12 @@ export class SwitchboardRuntime {
       this.managedCertificates.push(certificate);
     }
     this.managedCertificateContexts.set(hostname, context);
-    void this.reportIntentHealthBestEffort("certificate_installed", {
+    await this.reportIntentHealthBestEffort("certificate_installed", {
+      hostname,
+      issuer: certificate.issuer,
+      notAfter: certificate.notAfter
+    });
+    await this.log("certificate-install-succeeded", {
       hostname,
       issuer: certificate.issuer,
       notAfter: certificate.notAfter
@@ -1597,7 +1680,7 @@ export class SwitchboardRuntime {
       await this.log("customer-hostname-certificate-requesting", { hostnames }).catch(() => undefined);
       const certificates = await this.requestCertificates(hostnames);
       for (const certificate of certificates) {
-        this.addManagedCertificate(certificate);
+        await this.addManagedCertificate(certificate);
       }
       this.setRuntimeConfig({
         SWITCHBOARD_CERTIFICATE_HOSTNAMES: this.managedCertificates.map((certificate) => certificate.hostname).join(",")
