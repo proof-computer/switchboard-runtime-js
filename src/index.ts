@@ -356,6 +356,7 @@ export interface SwitchboardRuntimeConfig {
   gatewayUpstreamAdmissionUrl?: string;
   gatewayUpstreamAdmissionMode?: SwitchboardGatewayUpstreamAdmissionMode;
   gatewayUpstreamAdmissionDeadlineSeconds?: string | number;
+  gatewayUpstreamAdmissionAllowInsecureHttp?: boolean;
   activationDeadline?: string | number;
   endpointHostname?: string;
   certificateMode?: string;
@@ -988,6 +989,9 @@ export class SwitchboardRuntime {
       GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS: config.gatewayUpstreamAdmissionDeadlineSeconds === undefined
         ? undefined
         : String(config.gatewayUpstreamAdmissionDeadlineSeconds),
+      GATEWAY_UPSTREAM_ADMISSION_ALLOW_INSECURE_HTTP: config.gatewayUpstreamAdmissionAllowInsecureHttp === undefined
+        ? undefined
+        : String(config.gatewayUpstreamAdmissionAllowInsecureHttp),
       SWITCHBOARD_SESSION_ACTIVATION_DEADLINE: config.activationDeadline === undefined
         ? undefined
         : String(config.activationDeadline),
@@ -1205,7 +1209,11 @@ export class SwitchboardRuntime {
       return this.gatewayUpstreamAdmission;
     }
     const { request, requestSignature } = await this.buildGatewayUpstreamAdmissionRequest();
-    const gatewayUrl = requireSecureSwitchboardUrl(gatewayAdmissionUrl, "Switchboard gateway upstream admission URL", this.transportOptions());
+    const gatewayUrl = requireSecureSwitchboardUrl(
+      gatewayAdmissionUrl,
+      "Switchboard gateway upstream admission URL",
+      this.gatewayUpstreamAdmissionTransportOptions()
+    );
     allowAcurastHostname(gatewayUrl.toString(), this.std);
     const gatewayResponse = await this.fetchImpl(gatewayUrl, {
       method: "POST",
@@ -1723,6 +1731,14 @@ export class SwitchboardRuntime {
 
   private transportOptions(): SwitchboardTransportSecurityOptions {
     return { allowInsecureHttp: this.allowInsecureHttp };
+  }
+
+  private gatewayUpstreamAdmissionTransportOptions(): SwitchboardTransportSecurityOptions {
+    return {
+      allowInsecureHttp: this.allowInsecureHttp ||
+        configFlag(this.configValue("GATEWAY_UPSTREAM_ADMISSION_ALLOW_INSECURE_HTTP")) ||
+        configFlag(this.configValue("SWITCHBOARD_GATEWAY_UPSTREAM_ADMISSION_ALLOW_INSECURE_HTTP"))
+    };
   }
 
   private intentRequestTimeoutMs(): number {
@@ -2640,6 +2656,13 @@ function normalizeAcurastProcessorIdentity(
 
 function hex32String(value: string): boolean {
   return /^0x[0-9a-fA-F]{64}$/.test(value);
+}
+
+function configFlag(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }
 
 function configNameCandidates(name: string): string[] {

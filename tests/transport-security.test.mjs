@@ -242,6 +242,63 @@ describe("Switchboard runtime transport security", () => {
     assert.equal(fetchImpl.calls.length, 0);
   });
 
+  it("allows private HTTP gateway admission when runtime config explicitly enables it", async () => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const parsedUrl = new URL(url.toString());
+      const body = init.body ? JSON.parse(init.body.toString()) : undefined;
+      calls.push({ url: parsedUrl.toString(), path: parsedUrl.pathname, method: init.method ?? "GET", body });
+
+      if (parsedUrl.hostname === "192.168.0.230") {
+        return jsonResponse({
+          ok: true,
+          request: body.request,
+          requestSignature: body.signature,
+          observation: {
+            version: 1,
+            kind: "switchboard.gateway-upstream-observation",
+            admissionId: `0x${"aa".repeat(32)}`,
+            request: body.request,
+            requestDigest: `0x${"bb".repeat(32)}`,
+            observedIp: "203.0.113.44",
+            observedPort: 49152,
+            observedAt: "2026-05-22T12:00:00.000Z",
+            expiresAt: "2026-05-22T12:10:00.000Z",
+            tls: {
+              verified: true,
+              servername: body.request.validationHostname
+            }
+          },
+          observationSignature: {
+            scheme: "eip191-secp256k1",
+            domain: GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
+            signer: JOB_SIGNER,
+            signature: SIGNATURE,
+            signedAt: "2026-05-22T12:00:00.000Z"
+          }
+        });
+      }
+
+      return jsonResponse({ ok: true });
+    };
+
+    const runtime = createSwitchboardRuntime({
+      env: runtimeEnv({
+        SWITCHBOARD_RELAY_URL: "https://relay.example.test",
+        GATEWAY_UPSTREAM_ADMISSION_URL: "http://192.168.0.230:18080/v1/upstream-admissions",
+        GATEWAY_UPSTREAM_ADMISSION_ALLOW_INSECURE_HTTP: "true"
+      }),
+      fetchImpl
+    });
+
+    await runtime.admitGatewayUpstream();
+
+    assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
+      "POST http://192.168.0.230:18080/v1/upstream-admissions",
+      "POST https://relay.example.test/v1/deployment-intents/di_test/upstream-admissions"
+    ]);
+  });
+
   it("uses ECDSA CSRs by default and reports certificate request progress before fetch", async () => {
     const progress = [];
     const result = await requestCertificateWithRelay(
